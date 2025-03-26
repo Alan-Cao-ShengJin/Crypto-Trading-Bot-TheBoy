@@ -1,0 +1,6 @@
+timestamp,type,symbol,side,size,price,pnl,pnl_pct,balance,info
+2025-03-25 00:00:09,entry,BTCUSDC,buy,0.018,88295.9,0.0,0.0,383.94,"{'leverage': 5, 'stop_loss': 87878.0, 'take_profit': 88713.0}"
+2025-03-25 03:45:07,entry,BTCUSDC,sell,0.029,87989.2,0.0,0.0,374.41,"{'leverage': 7, 'stop_loss': 88273.0, 'take_profit': 87731.0}"
+2025-03-25 04:45:06,take_profit,BTCUSDC,buy,0.023,87869.73308917,2.7477389490900097,0.1359591142820138,364.2,{}
+2025-03-25 04:45:07,entry,BTCUSDC,sell,0.023,87889.7,0.0,0.0,364.2,"{'leverage': 6, 'stop_loss': 88198.0, 'take_profit': 87582.0}"
+2025-03-25 06:15:07,entry,BTCUSDC,sell,0.022,87742.0,0.0,0.0,354.27,"{'leverage': 6, 'stop_loss': 88061.0, 'take_profit': 87423.0}"

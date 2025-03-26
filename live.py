@@ -18,11 +18,12 @@ import sys
 from collections import deque
 from supertrend import supertrend_indicator
 from order_monitor import OrderMonitor
+import telegram as telegram
 
 client = UMFutures(key = api, secret = secret)
 
 # Trading parameters
-risk_percentage = 0.02
+# risk_percentage = 0.02
 risk_atr_period = 11
 risk_atr_multiple = 1.0
 tp_atr_multiple = 1.0
@@ -35,8 +36,11 @@ chop_length = 7
 chop_threshold = 44.0
 type = 'ISOLATED'
 timeframe = '4h'
+target_risk_percentage = 0.02  # Target risk (2%)
+min_acceptable_risk = 0.018    # Minimum acceptable risk (1.8%)
+risk_adjustment_factor = 1.1    # Adjustment factor to compensate for rounding
 
-# Binance BTCUSDT Futures constraints
+# Binance BTCUSDC Futures constraints
 MIN_ORDER_SIZE = 0.002  # Minimum order size is 0.002 BTC
 SAFE_MIN_SIZE = 0.005   # Safer minimum (allowing for 2 tranches)
 MAX_LEVERAGE = 125      # Maximum allowed leverage
@@ -57,9 +61,10 @@ first_tranche_closed = False
 trailing_stop_activated = False
 position_entry_price = 0
 position_entry_atr = 0
-current_stop_loss = 0
+current_stop_loss =  0
 current_take_profit = 0
 stop_order_monitor = False
+position_size = 0
 
 # P&L tracker and trade logging variables
 last_pnl_update = datetime.now()
@@ -73,7 +78,7 @@ trade_log_file = os.path.join(log_dir, "trade_log.txt")
 pnl_summary_file = os.path.join(log_dir, "pnl_summary.txt")
 
 class RateLimiter:
-    def __init__(self, max_calls_per_minute=20, max_calls_per_second=5):
+    def __init__(self, max_calls_per_minute=60, max_calls_per_second=20):
         self.max_calls_per_minute = max_calls_per_minute
         self.max_calls_per_second = max_calls_per_second
         self.minute_calls = deque()
@@ -86,22 +91,26 @@ class RateLimiter:
         # Clean up old timestamps
         self._cleanup_timestamps(current_time)
         
+        # Record this call (do this first to avoid race conditions)
+        self.second_calls.append(current_time)
+        self.minute_calls.append(current_time)
+        
         # Check if we need to wait (approaching limits)
         if len(self.second_calls) >= self.max_calls_per_second:
             sleep_time = 1.1 - (current_time - self.second_calls[0])
             if sleep_time > 0:
-                print(f"{TEXT_COLORS['YELLOW']}Rate limit approaching, waiting {sleep_time:.2f}s{TEXT_COLORS['RESET']}")
+                # Print a complete separate message with newlines
+                print(f"\n{TEXT_COLORS['YELLOW']}Rate limit approaching, waiting {sleep_time:.2f}s{TEXT_COLORS['RESET']}")
                 time.sleep(sleep_time)
+                print("")  # Extra newline for separation
                 
         if len(self.minute_calls) >= self.max_calls_per_minute:
             sleep_time = 60.1 - (current_time - self.minute_calls[0])
             if sleep_time > 0:
-                print(f"{TEXT_COLORS['YELLOW']}Minute rate limit approaching, waiting {sleep_time:.2f}s{TEXT_COLORS['RESET']}")
+                # Print a complete separate message with newlines
+                print(f"\n{TEXT_COLORS['YELLOW']}Minute rate limit approaching, waiting {sleep_time:.2f}s{TEXT_COLORS['RESET']}")
                 time.sleep(sleep_time)
-        
-        # Record this call
-        self.second_calls.append(current_time)
-        self.minute_calls.append(current_time)
+                print("")  # Extra newline for separation
     
     def _cleanup_timestamps(self, current_time):
         """Remove timestamps older than the tracking periods"""
@@ -114,8 +123,9 @@ class RateLimiter:
     def handle_rate_limit_error(self):
         """Handle a rate limit error with exponential backoff"""
         wait_time = min(60, 5 * (2 ** len(self.minute_calls) / self.max_calls_per_minute))
-        print(f"{TEXT_COLORS['RED']}Rate limit exceeded. Backing off for {wait_time:.2f}s{TEXT_COLORS['RESET']}")
+        print(f"\r{TEXT_COLORS['RED']}Rate limit exceeded. Backing off for {wait_time:.2f}s{TEXT_COLORS['RESET']}", end='', flush=True)
         time.sleep(wait_time)
+        print("\r" + " " * 50 + "\r", end='', flush=True)  # Clear the line
 
 # Create a global rate limiter
 rate_limiter = RateLimiter()
@@ -137,11 +147,11 @@ def rate_limited(func):
     return wrapper
 
 @rate_limited
-def get_balance_usdt():
+def get_balance_usdc():
     try:
         response = client.balance(recvWindow=6000)
         for elem in response:
-            if elem['asset'] == 'USDT':
+            if elem['asset'] == 'USDC':
                 # Round down to 2 decimal places
                 return math.floor(float(elem['balance']) * 100) / 100
     except ClientError as error:
@@ -220,29 +230,66 @@ def countdown_with_animation():
     """Display a countdown timer with a swirl animation until the next candle."""
     next_candle = get_next_candle_time()
     swirl_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']  # Swirl characters
-    sleep_interval = 0.067  # Animation speed (adjusted for smoothness)
+    sleep_interval = 0.3  # Slower animation speed to reduce CPU usage
+    
+    # Track time for PnL updates
+    last_pnl_check = datetime.now()
+    pnl_check_interval = 300  # 5 minutes in seconds
 
     try:
         # Hide the cursor using ANSI escape code
         print("\033[?25l", end='', flush=True)
         
         # Cycle through swirl characters
-        swirl_cycle = cycle(swirl_chars)
+        char_index = 0
+        last_update_time = time.time()
+        last_message_length = 0
+        
         while (time_left := (next_candle - datetime.now()).total_seconds()) > 0:
-            minutes, seconds = divmod(int(time_left), 60)
-            time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
-            message = f"{next(swirl_cycle)} Next candle closes in {time_str}"
-            # Use carriage return to overwrite the line
-            print(message, end='\r', flush=True)
-            time.sleep(sleep_interval)
+            current_time = time.time()
+            time_since_update = current_time - last_update_time
+            
+            if time_since_update >= sleep_interval:
+                # Update animation only when enough time has passed
+                char_index = (char_index + 1) % len(swirl_chars)
+                minutes, seconds = divmod(int(time_left), 60)
+                time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
+                message = f"{swirl_chars[char_index]} Next candle closes in {time_str}"
+                
+                # Make sure to clear previous message completely
+                clear_str = "\r" + " " * max(last_message_length, len(message) + 5)
+                print(clear_str, end="\r", flush=True)
+                print(message, end="", flush=True)
+                
+                # Remember length for next clear
+                last_message_length = len(message)
+                last_update_time = current_time
+            
+            # Check for P&L update
+            now = datetime.now()
+            if (now - last_pnl_check).total_seconds() >= pnl_check_interval:
+                # Clear current line and move to a new line before showing update
+                print("\r" + " " * last_message_length + "\r\n", flush=True)
+                print("\033[?25h", flush=True)  # Show cursor
+                
+                # Call check_pnl_update directly
+                check_pnl_update()
+                last_pnl_check = now
+                
+                # Hide cursor again and prepare for next animation
+                print("\033[?25l", end="", flush=True)
+                last_update_time = 0
+                last_message_length = 0
+            
+            # Small sleep to prevent CPU hogging
+            time.sleep(0.1)
         
         # Clear the line and show the cursor again
-        print("\r" + " " * 50 + "\r", end='', flush=True)  # Overwrite with spaces
-        print("\033[?25h", end='', flush=True)  # Show cursor
+        print("\r" + " " * last_message_length + "\r", end="", flush=True)
+        print("\033[?25h", end="", flush=True)
     
     except Exception as e:
-        # Ensure cursor is shown if an error occurs
-        print("\033[?25h", end='', flush=True)
+        print("\033[?25h", end="", flush=True)
         print(f"\nError in countdown: {e}")
 
 @rate_limited
@@ -279,20 +326,36 @@ def calculate_atr(df, length=risk_atr_period):
     return atr
 
 def setup_position(symbol):
-
-    equity = get_balance_usdt()
+    equity = get_balance_usdc()
     df = klines(symbol)
     df = calculate_atr(df)
-    atr_value = df.round(1).iloc[-2]
+    atr_value = df.round(1).iloc[-1]
 
     try:
-        current_price = klines(symbol).iloc[-2]['close']
+        current_price = klines(symbol).iloc[-1]['close']
         stop_distance = atr_value * risk_atr_multiple
-        risk_amount = round(equity * risk_percentage, 1)
+        
+        # Use adjusted risk percentage with compensation factor
+        adjusted_risk_percentage = target_risk_percentage * risk_adjustment_factor
+        risk_amount = round(equity * adjusted_risk_percentage, 1)
+        
+        # Log the adjusted risk calculation
+        print(f"{TEXT_COLORS['CYAN']}Risk Calculation:{TEXT_COLORS['RESET']}")
+        print(f"Target risk: {target_risk_percentage * 100:.2f}%")
+        print(f"Adjusted risk target: {adjusted_risk_percentage * 100:.2f}% (with {risk_adjustment_factor}x factor)")
+        print(f"Risk amount: ${risk_amount:.2f}")
+        
         position_size_raw = risk_amount / stop_distance
         qty_precision = get_qty_precision(symbol)[0]
         scaling_factor = 10 ** qty_precision
-        position_size = math.floor(position_size_raw * scaling_factor) / scaling_factor
+        
+        # Try rounding instead of floor for better accuracy when possible
+        position_size = round(position_size_raw * scaling_factor) / scaling_factor
+        
+        # Fall back to floor if rounding would make the position too large
+        if position_size > position_size_raw * 1.05:  # If rounding increases by more than 5%
+            position_size = math.floor(position_size_raw * scaling_factor) / scaling_factor
+            print(f"{TEXT_COLORS['YELLOW']}Using floor instead of round for position size{TEXT_COLORS['RESET']}")
 
         if position_size < SAFE_MIN_SIZE:
             print(f"{TEXT_COLORS['RED']}Risk-based size {position_size:.8f} BTC is below safe minimum {SAFE_MIN_SIZE} BTC{TEXT_COLORS['RESET']}")
@@ -313,13 +376,37 @@ def setup_position(symbol):
                 print(f"{TEXT_COLORS['RED']}Leverage is exceeding maximum allowable leverage... Stopping the bot...{TEXT_COLORS['RESET']}")
                 sys.exit(1)
 
-        actual_risk = position_size * stop_distance
+        # Calculate actual risk with leverage considered
+        actual_risk = (position_size * stop_distance) / leverage
         risk_percentage_actual = (actual_risk / equity) * 100
+
+        # Validate if actual risk is below minimum threshold
+        if risk_percentage_actual < min_acceptable_risk * 100:
+            print(f"{TEXT_COLORS['YELLOW']}WARNING: Actual risk ({risk_percentage_actual:.2f}%) is below minimum target ({min_acceptable_risk * 100:.2f}%){TEXT_COLORS['RESET']}")
+            
+            # Try to bump up position size if possible
+            next_size = position_size + (1 / scaling_factor)
+            next_position_value = next_size * current_price
+            next_required_margin = next_position_value / leverage
+            
+            if next_required_margin <= buffered_equity:
+                position_size = next_size
+                position_value = next_position_value
+                required_margin = next_required_margin
+                # Recalculate actual risk
+                actual_risk = (position_size * stop_distance) / leverage
+                risk_percentage_actual = (actual_risk / equity) * 100
+                print(f"{TEXT_COLORS['GREEN']}Increased position size to {position_size} BTC to achieve risk of {risk_percentage_actual:.2f}%{TEXT_COLORS['RESET']}")
+            else:
+                print(f"{TEXT_COLORS['YELLOW']}Cannot increase position size due to margin constraints{TEXT_COLORS['RESET']}")
+        
+        print(f"{TEXT_COLORS['GREEN']}Final actual risk: {risk_percentage_actual:.2f}% of equity{TEXT_COLORS['RESET']}")
 
         return stop_distance, position_size, leverage, position_value, required_margin, buffered_equity
 
     except Exception as e:
         print(f"{TEXT_COLORS['RED']}Error in setup_position: {str(e)}{TEXT_COLORS['RESET']}")
+        traceback.print_exc()
         sys.exit(1)
 
 @rate_limited
@@ -429,7 +516,7 @@ def log_trade(trade_type, symbol, side, size, price, pnl=0.0, pnl_pct=0.0, addit
         'price': price,
         'pnl': pnl,
         'pnl_pct': pnl_pct,
-        'balance': get_balance_usdt(),
+        'balance': get_balance_usdc(),
         'info': additional_info or {}
     }
     
@@ -524,13 +611,14 @@ def check_pnl_update():
     
     now = datetime.now()
     if (now - last_pnl_update).total_seconds() >= 300:  # 5 minutes = 300 seconds
-        print(f"\n{TEXT_COLORS['GREEN']}=== 5-MINUTE P&L UPDATE ==={TEXT_COLORS['RESET']}")
+        timestamp = now.strftime('%Y-%m-%d %H:%M:%S')
+        print(f"\n{TEXT_COLORS['GREEN']}=== 5-MINUTE P&L UPDATE [{timestamp}] ==={TEXT_COLORS['RESET']}")
         
         # Calculate and print current P&L
         position = get_open_positions(symbol)
-        balance = get_balance_usdt()
+        balance = get_balance_usdc()
         
-        print(f"Current Balance: ${balance:.2f}")
+        print(f"Current Balance: {TEXT_COLORS['GREEN']}{balance:.2f} USDC{TEXT_COLORS['RESET']}")
         
         if position:
             unrealized_pnl, pnl_pct = calculate_unrealized_pnl(position)
@@ -541,6 +629,20 @@ def check_pnl_update():
             print(f"Current Price: ${position['mark_price']:.2f}")
             print(f"Unrealized P&L: {pnl_color}${unrealized_pnl:.2f} ({pnl_pct:.2f}%){TEXT_COLORS['RESET']}")
             
+            telegram.notify_pnl_update(
+                symbol=symbol,
+                side=position['side'],
+                size=position['size'],
+                entry_price=position['entry_price'],
+                current_price=position['mark_price'],
+                unrealized_pnl=unrealized_pnl,
+                pnl_pct=pnl_pct,
+                balance=balance,
+                stop_loss=current_stop_loss,
+                take_profit=current_take_profit if not first_tranche_closed else None,
+                trailing_active=trailing_stop_activated
+            )
+
             # Show risk management info if available
             if 'current_stop_loss' in globals() and current_stop_loss > 0:
                 stop_distance = abs(position['mark_price'] - current_stop_loss)
@@ -564,7 +666,8 @@ def check_pnl_update():
             
         # Update last PnL update time
         last_pnl_update = now
-        print(f"Next P&L update at: {(now + timedelta(minutes=5)).strftime('%H:%M:%S')}")
+        next_update_time = (now + timedelta(minutes=5)).strftime('%H:%M:%S')
+        print(f"Next P&L update at: {next_update_time}")
 
 def generate_pnl_summary():
     """Generate a comprehensive P&L summary."""
@@ -598,7 +701,7 @@ def generate_pnl_summary():
         
         # Calculate starting equity and current equity
         starting_equity = trade_history[0]['balance'] if trade_history else 0
-        current_equity = get_balance_usdt()
+        current_equity = get_balance_usdc()
         equity_growth = ((current_equity / starting_equity) - 1) * 100 if starting_equity > 0 else 0
         
         # Format the summary
@@ -648,8 +751,9 @@ def generate_pnl_summary():
                 print(line)
         
         # Save the summary to a file with no colors
+
         try:
-            with open(pnl_summary_file, 'w') as f:
+            with open(pnl_summary_file, 'w', encoding='utf-8') as f:  # Add encoding='utf-8' here
                 for line in summary:
                     f.write(line + '\n')
             print(f"P&L summary saved to {pnl_summary_file}")
@@ -673,16 +777,46 @@ def signal_strategy(symbol):
     df = calculate_chop(df)
 
     # Get latest values
-    st_trend = df['trend'].iloc[-2]
-    ssl = df['ssl'].iloc[-2]
-    st_buy_signal = df['buySignal'].iloc[-2]
-    st_sell_signal = df['sellSignal'].iloc[-2]
-    ssl_long_signal = df['ssl_long_signal'].iloc[-2]
-    ssl_short_signal = df['ssl_short_signal'].iloc[-2]
-    is_choppy = df['is_choppy'].iloc[-2]
-    chop_value = df['chop'].iloc[-2]
-    atr_val = df['atr'].iloc[-2]
-    current_price = df['close'].iloc[-2]
+    st_trend = df['trend'].iloc[-1]
+    ssl = df['ssl'].iloc[-1]
+    st_buy_signal = df['buySignal'].iloc[-1]
+    st_sell_signal = df['sellSignal'].iloc[-1]
+    ssl_long_signal = df['ssl_long_signal'].iloc[-1]
+    ssl_short_signal = df['ssl_short_signal'].iloc[-1]
+    is_choppy = df['is_choppy'].iloc[-1]
+    chop_value = df['chop'].iloc[-1]
+    atr_val = df['atr'].iloc[-1]
+    current_price = df['close'].iloc[-1]
+    
+    # Get SuperTrend upper and lower bands
+    st_upper = df['up'].iloc[-1]
+    st_lower = df['dn'].iloc[-1]
+    
+    # Get SSL Channel upper and lower bands
+    ssl_upper = df['sma_high'].iloc[-1]
+    ssl_lower = df['sma_low'].iloc[-1]
+
+    # Print detailed indicator values
+    print(f"\n{TEXT_COLORS['CYAN']}INDICATOR VALUES:{TEXT_COLORS['RESET']}")
+    print(f"Current Price: ${current_price:.2f}")
+    print(f"ATR: ${atr_val:.2f}")
+    
+    print(f"\n{TEXT_COLORS['CYAN']}SSL CHANNEL:{TEXT_COLORS['RESET']}")
+    print(f"SSL Direction: {TEXT_COLORS['GREEN'] if ssl == 1 else TEXT_COLORS['RED']}{ssl:+.0f}{TEXT_COLORS['RESET']} ({'Uptrend' if ssl == 1 else 'Downtrend' if ssl == -1 else 'Neutral'})")
+    print(f"SSL Upper Band: ${ssl_upper:.2f}")
+    print(f"SSL Lower Band: ${ssl_lower:.2f}")
+    print(f"SSL Long Signal: {TEXT_COLORS['GREEN'] if ssl_long_signal else TEXT_COLORS['RESET']}{ssl_long_signal}{TEXT_COLORS['RESET']}")
+    print(f"SSL Short Signal: {TEXT_COLORS['RED'] if ssl_short_signal else TEXT_COLORS['RESET']}{ssl_short_signal}{TEXT_COLORS['RESET']}")
+    
+    print(f"\n{TEXT_COLORS['CYAN']}SUPERTREND:{TEXT_COLORS['RESET']}")
+    print(f"SuperTrend: {TEXT_COLORS['GREEN'] if st_trend == 1 else TEXT_COLORS['RED']}{st_trend:+d}{TEXT_COLORS['RESET']} ({'Uptrend' if st_trend == 1 else 'Downtrend'})")
+    print(f"SuperTrend Upper Band: ${st_upper:.2f}")
+    print(f"SuperTrend Lower Band: ${st_lower:.2f}")
+    print(f"SuperTrend Buy Signal: {TEXT_COLORS['GREEN'] if st_buy_signal else TEXT_COLORS['RESET']}{st_buy_signal}{TEXT_COLORS['RESET']}")
+    print(f"SuperTrend Sell Signal: {TEXT_COLORS['RED'] if st_sell_signal else TEXT_COLORS['RESET']}{st_sell_signal}{TEXT_COLORS['RESET']}")
+    
+    print(f"\n{TEXT_COLORS['CYAN']}MARKET CONDITIONS:{TEXT_COLORS['RESET']}")
+    print(f"Choppiness: {TEXT_COLORS['YELLOW'] if is_choppy else TEXT_COLORS['GREEN']}{chop_value:.2f}{TEXT_COLORS['RESET']} ({'Choppy' if is_choppy else 'Trending'})")
 
     # Check for trend flips
     supertrend_up_flip = st_buy_signal or (prev_supertrend == -1 and st_trend == 1)
@@ -700,8 +834,9 @@ def signal_strategy(symbol):
     if ssl_down_flip:
         print(f"{TEXT_COLORS['RED']}SSL flip to DOWNTREND detected{TEXT_COLORS['RESET']}")
     
-    # Check for SuperTrend reset, if 
+    # Check for SuperTrend reset
     st_reset_detected = st_buy_signal or st_sell_signal
+    print(f"SuperTrend Reset Detected: {TEXT_COLORS['YELLOW'] if st_reset_detected else TEXT_COLORS['RESET']}{st_reset_detected}{TEXT_COLORS['RESET']}")
 
     # Entry conditions
     long_entry = (ssl_up_flip and st_trend == 1) or (supertrend_up_flip and ssl == 1)
@@ -726,17 +861,53 @@ def signal_strategy(symbol):
     prev_supertrend = st_trend
     prev_ssl = ssl
 
+    # Print verdict
+    print(f"\n{TEXT_COLORS['CYAN']}VERDICT:{TEXT_COLORS['RESET']}")
+    
     # Log signal
     if long_entry:
-        print(f"{TEXT_COLORS['GREEN']}LONG ENTRY SIGNAL: {'SSL flip + ST uptrend' if ssl_up_flip else 'ST flip + SSL uptrend'}{TEXT_COLORS['RESET']}")
+        entry_reason = 'SSL flip + ST uptrend' if ssl_up_flip else 'ST flip + SSL uptrend'
+        print(f"{TEXT_COLORS['GREEN']}LONG ENTRY SIGNAL: {entry_reason}{TEXT_COLORS['RESET']}")
         return 'up', atr_val, current_price
     elif short_entry:
-        print(f"{TEXT_COLORS['RED']}SHORT ENTRY SIGNAL: {'SSL flip + ST downtrend' if ssl_down_flip else 'ST flip + SSL downtrend'}{TEXT_COLORS['RESET']}")
+        entry_reason = 'SSL flip + ST downtrend' if ssl_down_flip else 'ST flip + SSL downtrend'
+        print(f"{TEXT_COLORS['RED']}SHORT ENTRY SIGNAL: {entry_reason}{TEXT_COLORS['RESET']}")
         return 'down', atr_val, current_price
     else:
+        # Explain why no entry signal
+        reasons = []
+        # Check conditions for long entry
+        if not ((ssl_up_flip and st_trend == 1) or (supertrend_up_flip and ssl == 1)):
+            if not ssl_up_flip and not supertrend_up_flip:
+                reasons.append("No bullish indicator flips")
+            elif ssl_up_flip and st_trend != 1:
+                reasons.append("SSL flipped bullish but SuperTrend is bearish")
+            elif supertrend_up_flip and ssl != 1:
+                reasons.append("SuperTrend flipped bullish but SSL is bearish")
+        elif st_reset_detected and is_choppy:
+            reasons.append("Signal rejected due to choppy market during SuperTrend reset")
+            
+        # Check conditions for short entry
+        if not ((ssl_down_flip and st_trend == -1) or (supertrend_down_flip and ssl == -1)):
+            if not ssl_down_flip and not supertrend_down_flip:
+                if not any(r == "No bullish indicator flips" for r in reasons):
+                    reasons.append("No bearish indicator flips")
+            elif ssl_down_flip and st_trend != -1:
+                reasons.append("SSL flipped bearish but SuperTrend is bullish")
+            elif supertrend_down_flip and ssl != -1:
+                reasons.append("SuperTrend flipped bearish but SSL is bullish")
+        elif st_reset_detected and is_choppy:
+            if not any(r == "Signal rejected due to choppy market during SuperTrend reset" for r in reasons):
+                reasons.append("Signal rejected due to choppy market during SuperTrend reset")
+        
+        if not reasons:
+            reasons.append("Indicators are not aligned for entry")
+            
+        print(f"{TEXT_COLORS['YELLOW']}NO ENTRY SIGNAL: {', '.join(reasons)}{TEXT_COLORS['RESET']}")
         print(f"Be patient, no signal right now...")
+        
         return 'none', atr_val, current_price
-
+    
 @rate_limited
 def get_open_positions(symbol):
     """Get open positions for the given symbol."""
@@ -771,13 +942,13 @@ def check_exit_signals(symbol, position):
     df = klines(symbol)
     df = calculate_supertrend(df)
     
-    current_price = df['close'].iloc[-2]
+    current_price = df['close'].iloc[-1]
     
     # Check for SuperTrend flip exit
-    if position['side'] == 'long' and df['sellSignal'].iloc[-2]:
+    if position['side'] == 'long' and df['sellSignal'].iloc[-1]:
         print(f"{TEXT_COLORS['CYAN']}EXIT SIGNAL: SuperTrend flipped to downtrend{TEXT_COLORS['RESET']}")
         return 'exit'
-    elif position['side'] == 'short' and df['buySignal'].iloc[-2]:
+    elif position['side'] == 'short' and df['buySignal'].iloc[-1]:
         print(f"{TEXT_COLORS['CYAN']}EXIT SIGNAL: SuperTrend flipped to uptrend{TEXT_COLORS['RESET']}")
         return 'exit'
     
@@ -802,6 +973,15 @@ def check_exit_signals(symbol, position):
             trailing_stop_activated = True
             current_stop_loss = current_price - (trailing_atr_multiple * position_entry_atr)
             print(f"{TEXT_COLORS['GREEN']}TRAILING STOP ACTIVATED at ${current_stop_loss:.2f}{TEXT_COLORS['RESET']}")
+            
+            telegram.notify_trailing_stop_activated(
+                symbol=symbol,
+                side=position['side'],
+                current_price=current_price,
+                stop_price=current_stop_loss,
+                distance_pct=(abs(current_price - current_stop_loss) / current_price) * 100
+            )
+            
             return 'trailing_activated'
         elif position['side'] == 'short' and current_price <= (position_entry_price - (trailing_atr_trigger * position_entry_atr)):
             trailing_stop_activated = True
@@ -814,10 +994,10 @@ def check_exit_signals(symbol, position):
 @rate_limited
 def open_order(symbol, side, atr_value, current_price):
 
-    global position_entry_price, position_entry_atr, current_stop_loss, current_take_profit
+    global position_entry_price, position_entry_atr, current_stop_loss, current_take_profit, position_size
     
     # Get account balance for risk calculation (rounded down to 2 decimal places)
-    equity = get_balance_usdt()
+    equity = get_balance_usdc()
     if equity is None or equity <= 0:
         print(f"{TEXT_COLORS['RED']}ERROR: Please check account balance{TEXT_COLORS['RESET']}")
         sys.exit(1)
@@ -833,9 +1013,11 @@ def open_order(symbol, side, atr_value, current_price):
 
     # Calculate stop loss price
     if side == 'buy':
-        stop_price = current_price - stop_distance
+        price_precision = get_price_precision('BTCUSDC')
+        stop_price = round(current_price - stop_distance, price_precision)
     else:
-        stop_price = current_price + stop_distance
+        price_precision = get_price_precision('BTCUSDC')
+        stop_price = round(current_price + stop_distance, price_precision)
    
     position_size = setup_position(symbol)[1]
     leverage = setup_position(symbol)[2]
@@ -852,7 +1034,7 @@ def open_order(symbol, side, atr_value, current_price):
         tp_price = round(current_price + (tp_atr_multiple * atr_value), price_precision)
     else:
         tp_price = round(current_price - (tp_atr_multiple * atr_value), price_precision)
-  
+
     # Print order details
     print(f"\n{TEXT_COLORS['CYAN']}ORDER DETAILS:{TEXT_COLORS['RESET']}")
     print(f"Symbol: {symbol}")
@@ -885,6 +1067,8 @@ def open_order(symbol, side, atr_value, current_price):
             sleep(1)
             
             # Place stop loss order
+            price_precision = get_price_precision('BTCUSDC')
+            stop_price = round(stop_price, price_precision)
             stop_loss_order = client.new_order(
                 symbol=symbol, 
                 side='SELL', 
@@ -897,6 +1081,8 @@ def open_order(symbol, side, atr_value, current_price):
             sleep(1)
             
             # Place take profit order for half position
+            price_precision = get_price_precision('BTCUSDC')
+            tp_price = round(tp_price, price_precision)
             qty_precision = get_qty_precision(symbol)[0]
             half_size = round(position_size / 2, qty_precision)
             take_profit_order = client.new_order(
@@ -960,7 +1146,18 @@ def open_order(symbol, side, atr_value, current_price):
         # Log the trade
         log_trade('entry', symbol, side, position_size, current_price, 
                   additional_info={'leverage': leverage, 'stop_loss': stop_price, 'take_profit': tp_price})
-            
+
+        telegram.notify_trade_entry(
+            symbol=symbol,
+            side=side,
+            price=current_price,
+            size=position_size,
+            stop_loss=stop_price,
+            take_profit=tp_price,
+            risk_amount=actual_risk_dollars,
+            leverage=leverage
+        )
+
         return True
         
     except ClientError as error:
@@ -992,6 +1189,15 @@ def close_position(symbol, position):
         exit_side = 'sell' if position['side'] == 'long' else 'buy'
         log_trade('exit', symbol, exit_side, position['size'], position['mark_price'], pnl, pnl_pct)
         
+        telegram.notify_trade_exit(
+            symbol=symbol,
+            side=position['side'],
+            price=position['mark_price'],
+            size=position['size'],
+            pnl=pnl,
+            pnl_pct=pnl_pct
+        )
+
         # Reset position tracking
         global first_tranche_closed, trailing_stop_activated
         first_tranche_closed = False
@@ -1009,13 +1215,21 @@ def update_stop_loss(symbol, position):
         # Cancel existing stop orders
         orders = client.get_open_orders(symbol=symbol)
         for order in orders:
-            if 'STOP' in order['type']:
-                client.cancel_order(symbol=symbol, orderId=order['orderId'])
-                print(f"{TEXT_COLORS['YELLOW']}Canceled old stop order{TEXT_COLORS['RESET']}")
+            if 'STOP' in order['type'] and 'orderId' in order and order['orderId']:
+                try:
+                    client.cancel_order(symbol=symbol, orderId=order['orderId'])
+                    print(f"{TEXT_COLORS['YELLOW']}Canceled old stop order (ID: {order['orderId']}){TEXT_COLORS['RESET']}")
+                except ClientError as cancel_error:
+                    if "Unknown order" in str(cancel_error) or "Order does not exist" in str(cancel_error):
+                        print(f"{TEXT_COLORS['YELLOW']}Order already cancelled or filled: {order['orderId']}{TEXT_COLORS['RESET']}")
+                    else:
+                        print(f"{TEXT_COLORS['RED']}Error cancelling order: {cancel_error.error_code} - {cancel_error.error_message}{TEXT_COLORS['RESET']}")
+            elif 'STOP' in order['type']:
+                print(f"{TEXT_COLORS['YELLOW']}Found STOP order without valid orderId, skipping cancel{TEXT_COLORS['RESET']}")
         
         # Place new stop order
         side = 'SELL' if position['side'] == 'long' else 'BUY'
-        client.new_order(
+        new_order = client.new_order(
             symbol=symbol,
             side=side,
             type='STOP_MARKET',
@@ -1023,7 +1237,7 @@ def update_stop_loss(symbol, position):
             stopPrice=current_stop_loss,
             reduceOnly='true'
         )
-        print(f"{TEXT_COLORS['GREEN']}New stop loss order placed at ${current_stop_loss:.2f}{TEXT_COLORS['RESET']}")
+        print(f"{TEXT_COLORS['GREEN']}New stop loss order placed at ${current_stop_loss:.2f} (Order ID: {new_order['orderId']}){TEXT_COLORS['RESET']}")
         
         # If this is called after a take profit hit, log it
         global first_tranche_closed
@@ -1045,6 +1259,17 @@ def update_stop_loss(symbol, position):
             log_trade('take_profit', symbol, 'sell' if position['side'] == 'long' else 'buy', 
                     half_size, position['mark_price'], pnl, pnl_pct)
             
+            telegram.notify_take_profit_hit(
+                symbol=symbol,
+                side=position['side'],
+                price=position['mark_price'],
+                size=half_size,
+                profit=pnl,
+                profit_pct=pnl_pct,
+                remaining_size=position['size'],
+                new_stop_loss=current_stop_loss
+            )
+
             print(f"{TEXT_COLORS['GREEN']}Take profit hit! Stop loss moved to breakeven at ${position_entry_price:.2f}{TEXT_COLORS['RESET']}")
         
         return True
@@ -1052,15 +1277,37 @@ def update_stop_loss(symbol, position):
         print(f"{TEXT_COLORS['RED']}Error updating stop loss: {error.error_code} - {error.error_message}{TEXT_COLORS['RESET']}")
         return False
 
+def get_current_stop_loss():
+    """Provide access to the current stop loss value for OrderMonitor."""
+    global current_stop_loss
+    return current_stop_loss
+
 def handle_take_profit_fill(symbol, position, half_size):
     """Handle when a take profit order is filled."""
     global first_tranche_closed, current_stop_loss
+    
+    # Print detailed debug information
+    print(f"{TEXT_COLORS['YELLOW']}===== TAKE PROFIT HIT - DEBUG INFO ====={TEXT_COLORS['RESET']}")
+    print(f"Current first_tranche_closed flag: {first_tranche_closed}")
+    print(f"Current stop loss: ${current_stop_loss:.2f}")
+    print(f"Position entry price: ${position_entry_price:.2f}")
+    print(f"Position size: {position['size']} BTC")
+    print(f"Position side: {position['side']}")
+    
+    # If already handled, log but don't continue
+    if first_tranche_closed:
+        print(f"{TEXT_COLORS['YELLOW']}Take profit already processed previously. No action needed.{TEXT_COLORS['RESET']}")
+        return
     
     # Update state
     first_tranche_closed = True
     
     # Move stop loss to breakeven
+    old_stop_loss = current_stop_loss
     current_stop_loss = position_entry_price
+    
+    print(f"{TEXT_COLORS['GREEN']}First tranche flag set to TRUE{TEXT_COLORS['RESET']}")
+    print(f"{TEXT_COLORS['GREEN']}Stop loss moved from ${old_stop_loss:.2f} to ${current_stop_loss:.2f} (breakeven){TEXT_COLORS['RESET']}")
     
     # Calculate P&L for the closed portion
     if position['side'] == 'long':
@@ -1088,11 +1335,11 @@ def verify_connectivity(max_retries=3, retry_delay=5):
             # Try to get server time
             server_time = client.time()
             # Try to get account balance
-            balance = get_balance_usdt()
+            balance = get_balance_usdc()
             
             if balance is not None:
                 print(f"{TEXT_COLORS['GREEN']}Connection successful! Server time: {datetime.fromtimestamp(server_time['serverTime'] / 1000)}{TEXT_COLORS['RESET']}")
-                print(f"{TEXT_COLORS['GREEN']}Account balance: ${balance:.2f} USDT{TEXT_COLORS['RESET']}")
+                print(f"{TEXT_COLORS['GREEN']}Account balance: {balance:.2f} USDC{TEXT_COLORS['RESET']}")
                 return True
                 
         except Exception as e:
@@ -1106,13 +1353,13 @@ def verify_connectivity(max_retries=3, retry_delay=5):
     return False
 
 # Main trading loop
-symbol = 'BTCUSDT'
+symbol = 'BTCUSDC'
 cycle_count = 0
 
 print(f"\n{TEXT_COLORS['GREEN']}=== THE BOY - TRADING BOT ==={TEXT_COLORS['RESET']}")
 print(f"{TEXT_COLORS['GREEN']}Strategy Parameters:{TEXT_COLORS['RESET']}")
 print(f"Timeframe: {timeframe}")
-print(f"Risk: {risk_percentage*100}% of equity")
+print(f"Risk: {target_risk_percentage*100}% of equity")
 print(f"Stop Loss: {risk_atr_multiple}x ATR")
 print(f"Take Profit: {tp_atr_multiple}x ATR")
 print(f"SuperTrend Period: {supertrend_atr_period}")
@@ -1124,7 +1371,6 @@ print(f"Margin Type: {type}")
 print(f"Dynamic leverage calculation: Enabled\n")
 
 # Import the OrderMonitor class at the top of your file
-# from order_monitor import OrderMonitor
 
 # Function to check if first tranche is closed (to pass as reference)
 def is_first_tranche_closed():
@@ -1144,7 +1390,7 @@ if not verify_connectivity():
 
 # Initialize and start the order monitor after verifying connectivity
 from order_monitor import OrderMonitor
-order_monitor = OrderMonitor(client, rate_limiter, order_monitor_handlers)
+order_monitor = OrderMonitor(client, rate_limiter, order_monitor_handlers, get_current_stop_loss)
 order_monitor.start(symbol, is_first_tranche_closed)
 print(f"{TEXT_COLORS['GREEN']}Real-time order monitoring started{TEXT_COLORS['RESET']}")
 
@@ -1154,13 +1400,13 @@ while True:
         print(f"\n=== CYCLE #{cycle_count} ===")
         
         # Check balance
-        equity = get_balance_usdt()
+        equity = get_balance_usdc()
         if equity is None:
             print(f"{TEXT_COLORS['RED']}Cannot connect to API. Check IP, restrictions or wait{TEXT_COLORS['RESET']}")
             sleep(60)
             continue
         
-        print(f"Balance: {TEXT_COLORS['GREEN']}${equity:.2f} USDT{TEXT_COLORS['RESET']}")
+        print(f"Balance: {TEXT_COLORS['GREEN']}{equity:.2f} USDC{TEXT_COLORS['RESET']}")
         
         # Check if we have an open position
         position = get_open_positions(symbol)
@@ -1190,10 +1436,15 @@ while True:
                 print(f"Trailing Stop: {TEXT_COLORS['GREEN']}ACTIVE{TEXT_COLORS['RESET']}")
             
             # Check if any open orders got filled
+
             try:
                 closed_orders = client.get_all_orders(symbol=symbol, limit=10)
                 take_profit_filled = False
                 
+                # Store previous position size for comparison
+                previous_position_size = position['size']
+                
+                # Check for filled take profit orders
                 for order in closed_orders:
                     if (order['status'] == 'FILLED' and 
                         'TAKE_PROFIT' in order['type'] and 
@@ -1204,45 +1455,104 @@ while True:
                         update_stop_loss(symbol, position)
                         break
                 
+                # Additional check - if position size is roughly half what it was at entry
+                # This serves as a backup detection method for take profit fills
+                if not first_tranche_closed and not take_profit_filled:
+                    # Get the initial position size (this is saved during entry)
+                    initial_position_size = position_size if 'position_size' in globals() else position['size'] * 2
+                    
+                    # If current size is close to half of initial size (with tolerance for rounding)
+                    if position['size'] <= initial_position_size * 0.6:
+                        print(f"{TEXT_COLORS['YELLOW']}Position size decreased significantly. Take profit likely hit.{TEXT_COLORS['RESET']}")
+                        print(f"{TEXT_COLORS['GREEN']}Moving stop loss to breakeven.{TEXT_COLORS['RESET']}")
+                        half_size = position['size']
+                        handle_take_profit_fill(symbol, position, half_size)
+                        update_stop_loss(symbol, position)
+                
+                # Check for stop loss hits to clean up remaining orders
+                stop_loss_hit = any(
+                    order['status'] == 'FILLED' and 
+                    'STOP' in order['type'] and
+                    not 'TAKE_PROFIT' in order['type'] 
+                    for order in closed_orders
+                )
+                
+                # If a stop loss was hit but we still have the original take profit order
+                if stop_loss_hit and not first_tranche_closed:
+                    print(f"{TEXT_COLORS['RED']}Stop loss hit detected! Cancelling remaining orders...{TEXT_COLORS['RESET']}")
+                    client.cancel_open_orders(symbol=symbol)
+                    print(f"{TEXT_COLORS['YELLOW']}All remaining orders canceled{TEXT_COLORS['RESET']}")
+                    
+                    # Reset position flags
+                    first_tranche_closed = False
+                    trailing_stop_activated = False
+                
             except Exception as e:
                 print(f"{TEXT_COLORS['RED']}Error checking order status: {str(e)}{TEXT_COLORS['RESET']}")
             
             # Check for exit signals
             exit_signal = check_exit_signals(symbol, position)
-            
+
+
             if exit_signal == 'exit':
-                # Store the reason for exit (for potential immediate reversal)
-                exit_reason = 'supertrend_reversal' if (
-                    (position['side'] == 'long' and calculate_supertrend(klines(symbol))['sellSignal'].iloc[-2]) or
-                    (position['side'] == 'short' and calculate_supertrend(klines(symbol))['buySignal'].iloc[-2])
-                ) else 'other'
+                # IMPORTANT: Capture all necessary data BEFORE closing the position
+                kl = klines(symbol)
+                
+                # Calculate all indicators on the SAME dataset
+                supertrend_df = calculate_supertrend(kl)
+                atr_val = calculate_atr(kl).iloc[-1]
+                ssl_df = calculate_ssl_channel(kl)
+                current_price = kl['close'].iloc[-1]
+                
+                # Check exact reversal conditions - both SuperTrend and SSL
+                is_long_reversal = (supertrend_df['buySignal'].iloc[-1] or 
+                                (supertrend_df['trend'].iloc[-1] == 1 and supertrend_df['trend'].shift(1).iloc[-1] == -1)) and \
+                                (ssl_df['ssl_long_signal'].iloc[-1] or 
+                                (ssl_df['ssl'].iloc[-1] == 1 and ssl_df['ssl'].shift(1).iloc[-1] == -1))
+                                
+                is_short_reversal = (supertrend_df['sellSignal'].iloc[-1] or 
+                                    (supertrend_df['trend'].iloc[-1] == -1 and supertrend_df['trend'].shift(1).iloc[-1] == 1)) and \
+                                    (ssl_df['ssl_short_signal'].iloc[-1] or 
+                                    (ssl_df['ssl'].iloc[-1] == -1 and ssl_df['ssl'].shift(1).iloc[-1] == 1))
+                
+                # Store the position side before closing
+                previous_position_side = position['side']
                 
                 # Close the current position
                 close_position(symbol, position)
                 
-                # If exit was due to SuperTrend reversal, check for immediate entry in opposite direction
-                if exit_reason == 'supertrend_reversal':
-                    print(f"{TEXT_COLORS['YELLOW']}SuperTrend reversal detected - checking for immediate entry...{TEXT_COLORS['RESET']}")
+                # Execute reversal IMMEDIATELY if conditions were met
+                if (is_long_reversal and previous_position_side == 'short') or \
+                (is_short_reversal and previous_position_side == 'long'):
                     
-                    # Generate signal
-                    signal, atr, current_price = signal_strategy(symbol)
+                    print(f"{TEXT_COLORS['YELLOW']}Immediate reversal condition detected on THIS candle!{TEXT_COLORS['RESET']}")
                     
-                    # Check if signal indicates a reversal entry
-                    if (signal == 'up' and position['side'] == 'short') or (signal == 'down' and position['side'] == 'long'):
-                        print(f"{TEXT_COLORS['YELLOW']}Immediate reversal opportunity detected{TEXT_COLORS['RESET']}")
+                    # Execute the reversal trade without any further checks
+                    if previous_position_side == 'long' and is_short_reversal:
+                        print(f"{TEXT_COLORS['RED']}Executing IMMEDIATE SHORT reversal entry...{TEXT_COLORS['RESET']}")
+                        open_order(symbol, 'sell', atr_val, current_price)
                         
-                        # Execute trade based on signal
-                        if signal == 'up':
-                            print(f"{TEXT_COLORS['GREEN']}LONG reversal entry, executing...{TEXT_COLORS['RESET']}")
-                            open_order(symbol, 'buy', atr, current_price)
-                        elif signal == 'down':
-                            print(f"{TEXT_COLORS['RED']}SHORT reversal entry, executing...{TEXT_COLORS['RESET']}")
-                            open_order(symbol, 'sell', atr, current_price)
-                    else:
-                        print(f"No immediate reversal opportunity detected.")
-                
-            elif exit_signal in ['update_stop', 'trailing_activated']:
-                update_stop_loss(symbol, position)
+                        # Notify about the reversal
+                        telegram.notify_signal(
+                            symbol=symbol,
+                            signal_type="down",
+                            reason="Immediate ST+SSL reversal",
+                            current_price=current_price
+                        )
+                        
+                    elif previous_position_side == 'short' and is_long_reversal:
+                        print(f"{TEXT_COLORS['GREEN']}Executing IMMEDIATE LONG reversal entry...{TEXT_COLORS['RESET']}")
+                        open_order(symbol, 'buy', atr_val, current_price)
+                        
+                        # Notify about the reversal
+                        telegram.notify_signal(
+                            symbol=symbol,
+                            signal_type="up",
+                            reason="Immediate ST+SSL reversal",
+                            current_price=current_price
+                        )
+                else:
+                    print(f"No immediate reversal condition on this candle. Will check for entry signals on next candle.")
         
         else:
             # No position open, check for entry signals
@@ -1285,4 +1595,7 @@ while True:
     except Exception as e:
         print(f"{TEXT_COLORS['RED']}Unexpected error: {str(e)}{TEXT_COLORS['RESET']}")
         traceback.print_exc()
+        
+        telegram.notify_error(f"Unexpected error: {str(e)}", traceback.format_exc())
+
         sleep(60)  # Wait a bit before retrying
