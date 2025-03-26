@@ -6,10 +6,11 @@ This version uses a direct approach without threading for easier integration.
 import requests
 import time
 from datetime import datetime
+from keys import TOKEN, CHAT_ID
 
 # Use credentials from telegram.py
-TOKEN = '8117020808:AAG24OpRWli-8XYpkZi4ELaYUi8rnJdMwqk'
-CHAT_ID = '356636774'
+TOKEN = TOKEN
+CHAT_ID = CHAT_ID
 
 def send_message(message, parse_mode=None):
     """Send a message to Telegram."""
